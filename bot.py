@@ -5,12 +5,14 @@ from zoneinfo import ZoneInfo
 import os
 import sqlite3
 
+
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
 from openai import OpenAI
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -414,21 +416,30 @@ def build_scan_prompt(results: list[dict]):
 # -------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "📈 *Swing Scanner Bot v3 – Advisor Mode*\n\n"
-        "Core commands:\n"
+        "<b>📈 Swing Scanner Bot v3 – Advisor Mode</b>\n\n"
+        "<b>What I can do for you:</b>\n"
+        "• Scan NIFTY 500 for swing setups\n"
+        "• Send 30-min alerts for your watchlist\n"
+        "• Generate auto-GTT order files\n"
+        "• Give daily morning summaries\n"
+        "• Create PNG charts for each stock\n"
+        "• Log everything into SQLite so you can review later\n\n"
+        "<b>Core commands:</b>\n"
         "/scan – Scan NIFTY 500 now\n"
-        "/alerts_on – 30-min realtime alerts\n"
-        "/alerts_off – Stop alerts\n"
-        "/daily_on – Daily morning report (9:15 IST)\n"
-        "/daily_off – Stop daily report\n"
-        "/gtt – Generate GTT CSV from latest scan\n"
+        "/alerts – Show/refresh alert configuration\n"
+        "/gtt – Generate GTT order CSV\n"
+        "/daily – Force-send today’s morning report\n"
         "/chart SYMBOL – Price chart PNG (e.g. /chart BEL)\n\n"
-        "Advisor mode:\n"
-        "/explain SYMBOL – AI explanation of that stock's swing setup\n"
-        "/ai_scan – AI commentary on the latest scan\n"
-        "/ask your question – General swing-trading question (e.g. /ask How to size positions?)\n"
+        "<b>Advisor mode:</b>\n"
+        "Just type a normal message like:\n"
+        "\"Can I swing trade BEL for 3–5 days with capital 4000?\"\n"
+        "and I’ll analyse risk, levels and give a plan.\n\n"
+        "<i>Bot is live in the cloud – scanner + alerts + daily + charts + GTT + DB + advisor mode.</i>\n"
+        "Let’s hunt for clean swing setups. 🔍📊"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
