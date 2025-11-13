@@ -669,6 +669,49 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = await asyncio.to_thread(ai_generate, prompt)
     await update.message.reply_text(answer)
 
+# ------------------ SUMMARY COMMAND -----------------
+async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Quick summary of the latest swing scan.
+    Uses cached LAST_SCAN_RESULTS if available, otherwise runs a fresh scan.
+    """
+    global LAST_SCAN_RESULTS
+
+    await update.message.reply_text("📋 Building swing summary…")
+
+    results = LAST_SCAN_RESULTS
+    if not results:
+        # No cached results – run a fresh scan
+        results = await asyncio.to_thread(scan_universe)
+
+    if not results:
+        await update.message.reply_text("No swing setups found to summarise right now.")
+        return
+
+    total = len(results)
+    sectors = {r.get("industry", "Unknown") for r in results}
+    sector_count = len(sectors)
+
+    # Top 5 for a compact view
+    lines = [
+        "📋 *Swing Summary*",
+        f"Total candidates: *{total}*",
+        f"Sectors involved: *{sector_count}*",
+        "",
+        "Top 5 by scan order:",
+    ]
+    for r in results[:5]:
+        lines.append(
+            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
+            f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
+            f"Signals: {', '.join(r['signals'])}"
+        )
+
+    heatmap = build_sector_heatmap(results)
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(heatmap, parse_mode="Markdown")
+
 
 # -------------------------------------------------
 # MAIN
