@@ -1,12 +1,14 @@
-import os
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Dict, List, Optional
-from urllib.parse import quote_plus
+from datetime import datetime, time as dtime
+from zoneinfo import ZoneInfo
+import os
+import sqlite3
 
+import pandas as pd
 import yfinance as yf
-import feedparser
+import matplotlib.pyplot as plt
+
 from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
@@ -15,586 +17,684 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ============================================================
-#  CONFIG – EDIT THESE
-# ============================================================
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "PASTE_YOUR_OPENAI_API_KEY_HERE")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE")
-
-if not OPENAI_API_KEY or OPENAI_API_KEY.startswith("PASTE_"):
-    raise RuntimeError("Set OPENAI_API_KEY in code or environment first.")
-if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN.startswith("PASTE_"):
-    raise RuntimeError("Set TELEGRAM_BOT_TOKEN in code or environment first.")
-
-# ============================================================
-#  LOGGING
-# ============================================================
-
+# -------------------------------------------------
+# LOGGING
+# -------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================
-#  OPENAI CLIENT
-# ============================================================
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
+# Prefer environment variables for cloud deployment
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+if not BOT_TOKEN:
+    raise RuntimeError("Set BOT_TOKEN or TELEGRAM_BOT_TOKEN in the environment first.")
 
 
-async def ask_gpt(system_prompt: str, user_prompt: str) -> str:
-    """Call OpenAI chat completion with basic safety around errors."""
+JOURNAL_FILE = "swing_journal.csv"
+DB_FILE = "swing_signals.db"
+NIFTY500_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+NIFTY500_DF = None
+NIFTY500_SYMBOLS = []
+LAST_SCAN_RESULTS = []  # cached latest scan results
+
+# OpenAI client (advisor mode)
+client = None
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+# -------------------------------------------------
+# DB INIT
+# -------------------------------------------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT,
+            symbol TEXT,
+            price REAL,
+            signals TEXT,
+            buy REAL,
+            target REAL,
+            stoploss REAL,
+            industry TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# -------------------------------------------------
+# UTIL – Load NIFTY 500
+# -------------------------------------------------
+def load_nifty500():
+    global NIFTY500_DF, NIFTY500_SYMBOLS
+    if NIFTY500_SYMBOLS:
+        return NIFTY500_SYMBOLS
+
+    df = pd.read_csv(NIFTY500_URL)
+    df["Symbol"] = df["Symbol"].astype(str).str.strip()
+    df["SymbolNS"] = df["Symbol"] + ".NS"
+    NIFTY500_DF = df
+    NIFTY500_SYMBOLS = df["SymbolNS"].tolist()
+    logger.info("Loaded %d NIFTY 500 symbols", len(NIFTY500_SYMBOLS))
+    return NIFTY500_SYMBOLS
+
+
+def get_industry(symbol_with_ns: str) -> str:
+    global NIFTY500_DF
+    if NIFTY500_DF is None:
+        load_nifty500()
+    sym = symbol_with_ns.replace(".NS", "").strip()
+    match = NIFTY500_DF.loc[NIFTY500_DF["Symbol"] == sym]
+    if not match.empty and "Industry" in match.columns:
+        return str(match["Industry"].iloc[0])
+    return "Unknown"
+
+
+# -------------------------------------------------
+# RSI CALC
+# -------------------------------------------------
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+
+# -------------------------------------------------
+# CORE – ANALYSE SINGLE STOCK
+# -------------------------------------------------
+def analyze_stock(symbol):
+    try:
+        data = yf.download(symbol, period="6mo", interval="1d", progress=False)
+        if data is None or data.empty or len(data) < 50:
+            return None
+
+        data["SMA20"] = data["Close"].rolling(20).mean()
+        data["SMA50"] = data["Close"].rolling(50).mean()
+        data["RSI"] = compute_rsi(data["Close"])
+
+        last = data.iloc[-1]
+        prev = data.iloc[-2]
+
+        price = float(last["Close"])
+        signals = []
+
+        # Bullish SMA crossover
+        if last["SMA20"] > last["SMA50"] and prev["SMA20"] <= prev["SMA50"]:
+            signals.append("Bullish SMA20/50 Crossover")
+
+        # RSI oversold
+        if last["RSI"] < 35:
+            signals.append("RSI Oversold (<35)")
+
+        # Volume spike
+        vol_mean = data["Volume"].tail(20).mean()
+        if last["Volume"] > 1.8 * vol_mean:
+            signals.append("Volume Spike (>1.8x 20D avg)")
+
+        if not signals:
+            return None
+
+        buy_price = round(price * 0.985, 2)
+        target_price = round(price * 1.03, 2)
+        stoploss = round(price * 0.97, 2)
+
+        return {
+            "symbol": symbol.replace(".NS", ""),
+            "symbol_full": symbol,
+            "price": round(price, 2),
+            "signals": signals,
+            "buy": buy_price,
+            "target": target_price,
+            "stoploss": stoploss,
+        }
+
+    except Exception as e:
+        logger.warning("Error analysing %s: %s", symbol, e)
+        return None
+
+
+# -------------------------------------------------
+# JOURNAL LOGGING (CSV + SQLite)
+# -------------------------------------------------
+def log_journal(entry):
+    # CSV
+    df = pd.DataFrame([entry])
+    try:
+        if os.path.exists(JOURNAL_FILE):
+            old = pd.read_csv(JOURNAL_FILE)
+            df = pd.concat([old, df], ignore_index=True)
+    except Exception as e:
+        logger.warning("Error reading journal CSV: %s", e)
+    df.to_csv(JOURNAL_FILE, index=False)
+
+    # SQLite
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO signals (ts, symbol, price, signals, buy, target, stoploss, industry)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entry.get("datetime"),
+                entry.get("symbol"),
+                entry.get("price"),
+                entry.get("signals"),
+                entry.get("buy"),
+                entry.get("target"),
+                entry.get("stoploss"),
+                entry.get("industry", "Unknown"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning("Error inserting into DB: %s", e)
+
+
+# -------------------------------------------------
+# SCAN UNIVERSE
+# -------------------------------------------------
+def scan_universe():
+    global LAST_SCAN_RESULTS
+    symbols = load_nifty500()
+
+    results = []
+    for symbol in symbols:
+        stock_data = analyze_stock(symbol)
+        if not stock_data:
+            continue
+
+        industry = get_industry(symbol)
+        stock_data["industry"] = industry
+        results.append(stock_data)
+
+        log_journal(
+            {
+                "datetime": datetime.now().isoformat(timespec="seconds"),
+                "symbol": stock_data["symbol"],
+                "price": stock_data["price"],
+                "signals": "; ".join(stock_data["signals"]),
+                "buy": stock_data["buy"],
+                "target": stock_data["target"],
+                "stoploss": stock_data["stoploss"],
+                "industry": industry,
+            }
+        )
+
+    LAST_SCAN_RESULTS = results
+    return results
+
+
+# -------------------------------------------------
+# SECTOR HEATMAP
+# -------------------------------------------------
+def build_sector_heatmap(results):
+    if not results:
+        return "No sector data – no candidates today."
+
+    sector_counts = {}
+    for r in results:
+        sector = r.get("industry", "Unknown")
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+    items = sorted(sector_counts.items(), key=lambda x: x[1], reverse=True)
+
+    lines = ["📊 *Sector-wise Heatmap*"]
+    for sector, count in items[:15]:
+        bar = "🟩" * min(count, 10)
+        lines.append(f"{sector}: {bar} ({count})")
+
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
+# GTT ORDER CSV
+# -------------------------------------------------
+def generate_gtt_file(results, quantity=1, filename="gtt_orders.csv"):
+    if not results:
+        return None
+
+    rows = []
+    for r in results:
+        rows.append(
+            {
+                "symbol": r["symbol"],
+                "transaction_type": "BUY",
+                "quantity": quantity,
+                "limit_price": r["buy"],
+                "trigger_price": round(r["buy"] * 0.995, 2),
+                "target_price": r["target"],
+                "stoploss": r["stoploss"],
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(filename, index=False)
+    return filename
+
+
+# -------------------------------------------------
+# CHART GENERATION
+# -------------------------------------------------
+def create_price_chart(symbol: str):
+    # symbol can be "BEL" or "BEL.NS"
+    if not symbol.upper().endswith(".NS"):
+        symbol_full = symbol.upper() + ".NS"
+    else:
+        symbol_full = symbol.upper()
+
+    data = yf.download(symbol_full, period="6mo", interval="1d", progress=False)
+    if data is None or data.empty:
+        return None
+
+    data["SMA20"] = data["Close"].rolling(20).mean()
+    data["SMA50"] = data["Close"].rolling(50).mean()
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(data.index, data["Close"], label="Close")
+    plt.plot(data.index, data["SMA20"], label="SMA20")
+    plt.plot(data.index, data["SMA50"], label="SMA50")
+    plt.title(f"{symbol.upper()} – 6M Price with SMA20/50")
+    plt.xlabel("Date")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.tight_layout()
+
+    fname = f"{symbol.upper()}_chart.png"
+    plt.savefig(fname)
+    plt.close()
+    return fname
+
+
+# -------------------------------------------------
+# ADVISOR MODE – OpenAI HELPERS
+# -------------------------------------------------
+def ai_generate(text: str) -> str:
+    """Call OpenAI and return advisor text."""
+    if client is None:
+        return "AI advisor is not configured. Please set OPENAI_API_KEY in the environment."
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a calm, conservative swing-trading assistant for Indian equities. "
+                        "You explain things clearly using simple language, and you always include a risk/disclaimer line. "
+                        "Never claim to guarantee returns. Never give personalised investment advice; "
+                        "stick to educational, analytical commentary."
+                    ),
+                },
+                {"role": "user", "content": text},
             ],
-            max_tokens=900,
+            max_tokens=600,
+            temperature=0.25,
         )
-        return resp.choices[0].message.content
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        logger.exception("Error calling OpenAI: %s", e)
-        return (
-            "⚠️ I ran into an error while talking to the AI backend. "
-            "Please try again after some time."
+        logger.warning("OpenAI error: %s", e)
+        return "AI advisor is temporarily unavailable. Please try again later."
+
+
+def build_stock_prompt(symbol: str, analysis: dict | None):
+    base = f"Stock: {symbol}\n"
+    if analysis is None:
+        base += (
+            "No strong swing signals were detected from the technical scan, "
+            "but please provide a high-level educational view on how a swing trader "
+            "might think about this stock in general (without giving personalised advice).\n"
         )
+        return base
 
-
-# ============================================================
-#  STOCK DATA – yfinance
-# ============================================================
-
-def get_stock_snapshot(symbol: str) -> dict:
-    """
-    Fetch basic stock info & 6-month history from yfinance.
-    Used for /fundamental and /technical.
-    """
-    ticker = yf.Ticker(symbol)
-
-    hist = ticker.history(period="6mo")
-    if hist.empty:
-        raise ValueError("No price history found for this symbol.")
-
-    last_close = float(hist["Close"].iloc[-1])
-    ma20 = float(hist["Close"].tail(20).mean())
-    ma50 = float(hist["Close"].tail(50).mean()) if len(hist) >= 50 else None
-    ma200 = float(hist["Close"].tail(200).mean()) if len(hist) >= 200 else None
-
-    try:
-        info = ticker.info
-    except Exception as e:
-        logger.warning("Error fetching ticker.info for %s: %s", symbol, e)
-        info = {}
-
-    snapshot = {
-        "symbol": symbol,
-        "last_close": last_close,
-        "ma20": ma20,
-        "ma50": ma50,
-        "ma200": ma200,
-        "market_cap": info.get("marketCap"),
-        "trailing_pe": info.get("trailingPE"),
-        "forward_pe": info.get("forwardPE"),
-        "price_to_book": info.get("priceToBook"),
-        "dividend_yield": info.get("dividendYield"),
-        "sector": info.get("sector"),
-        "industry": info.get("industry"),
-        "long_name": info.get("longName") or info.get("shortName") or symbol,
-        "currency": info.get("currency"),
-        "52w_high": info.get("fiftyTwoWeekHigh"),
-        "52w_low": info.get("fiftyTwoWeekLow"),
-    }
-
-    return snapshot
-
-
-def get_current_price(symbol: str) -> Optional[float]:
-    """
-    Try to get the latest tradable price for symbol.
-    Uses fast_info if available, falls back to intraday history.
-    """
-    ticker = yf.Ticker(symbol)
-    # fast_info is usually the quickest
-    try:
-        fi = ticker.fast_info
-        for key in ("lastPrice", "last_price", "regularMarketPrice", "currentPrice"):
-            if key in fi and fi[key] is not None:
-                return float(fi[key])
-    except Exception as e:
-        logger.warning("fast_info failed for %s: %s", symbol, e)
-
-    # Fallback: use last intraday close
-    try:
-        hist = ticker.history(period="1d", interval="1m")
-        if not hist.empty:
-            return float(hist["Close"].iloc[-1])
-    except Exception as e:
-        logger.warning("history fallback failed for %s: %s", symbol, e)
-
-    return None
-
-
-# ============================================================
-#  NEWS – Google News RSS via feedparser
-# ============================================================
-
-def get_news_for_symbol(symbol: str, max_items: int = 6):
-    """
-    Very simple news fetch using Google News RSS.
-    """
-    query = f"{symbol} stock"
-    url = (
-        "https://news.google.com/rss/search?"
-        f"q={quote_plus(query)}&hl=en-IN&gl=IN&ceid=IN:en"
+    base += (
+        f"Last price: ₹{analysis['price']}\n"
+        f"Signals: {', '.join(analysis['signals'])}\n"
+        f"Suggested buy zone (from scanner): around ₹{analysis['buy']}\n"
+        f"Target (from scanner): ₹{analysis['target']}\n"
+        f"Stoploss (from scanner): ₹{analysis['stoploss']}\n\n"
+        "Using this information, explain:\n"
+        "1) What these signals broadly indicate for swing trading.\n"
+        "2) How a cautious swing trader might plan entries, exits, and position sizing.\n"
+        "3) Key risks and what could go wrong.\n"
+        "End with one clear disclaimer line."
     )
-
-    feed = feedparser.parse(url)
-    items = []
-    for entry in feed.entries[:max_items]:
-        published = getattr(entry, "published", "")
-        title = getattr(entry, "title", "No title")
-        link = getattr(entry, "link", "")
-        items.append(
-            {
-                "title": title,
-                "published": published,
-                "link": link,
-            }
-        )
-    return items
+    return base
 
 
-# ============================================================
-#  ALERTS – In-memory simple engine
-# ============================================================
-
-@dataclass
-class PriceAlert:
-    symbol: str
-    target: float
-    direction: str  # "above" or "below"
-
-
-# chat_id -> list of alerts
-ALERTS: Dict[int, List[PriceAlert]] = {}
-
-
-def add_price_alert(chat_id: int, symbol: str, target: float) -> str:
-    """
-    Create a price alert. Direction decided from current price:
-    - if current < target => alert when price goes ABOVE target
-    - if current > target => alert when price goes BELOW target
-    - if equal => trigger immediately & don't store
-    """
-    cur = get_current_price(symbol)
-    if cur is None:
+def build_scan_prompt(results: list[dict]):
+    if not results:
         return (
-            f"⚠️ Could not fetch current price for {symbol}. "
-            "Alert not created."
+            "The scanner found no swing candidates today from the NIFTY 500 universe. "
+            "Explain what this might mean for a swing trader and how they should think "
+            "about capital protection and patience."
         )
 
-    if cur < target:
-        direction = "above"
-        direction_text = "when price moves UP to or above"
-    elif cur > target:
-        direction = "below"
-        direction_text = "when price moves DOWN to or below"
-    else:
-        # already at target
-        return (
-            f"⚠️ {symbol} is already around {target:.2f}. "
-            "No alert created."
+    # Top 10 only to keep prompt small
+    subset = results[:10]
+    lines = ["Swing scanner results (subset):"]
+    for r in subset:
+        lines.append(
+            f"{r['symbol']} | Sector: {r.get('industry','Unknown')} | "
+            f"Price: {r['price']} | Signals: {', '.join(r['signals'])} | "
+            f"Buy: {r['buy']} | Target: {r['target']} | SL: {r['stoploss']}"
         )
 
-    alerts = ALERTS.setdefault(chat_id, [])
-    alerts.append(PriceAlert(symbol=symbol, target=target, direction=direction))
-
-    return (
-        f"✅ Alert set for {symbol} {direction_text} {target:.2f}.\n"
-        f"(Current price: {cur:.2f})"
+    lines.append(
+        "\nUsing this data, give:\n"
+        "1) A short market mood summary for swing trades.\n"
+        "2) Which sectors look relatively active (based only on this subset).\n"
+        "3) General risk management guidance for a trader using such a scanner.\n"
+        "Keep it under 250–300 words and end with a disclaimer."
     )
-
-
-def list_alerts(chat_id: int) -> str:
-    alerts = ALERTS.get(chat_id, [])
-    if not alerts:
-        return "You have no active alerts."
-
-    lines = ["🔔 Your active alerts:\n"]
-    for idx, al in enumerate(alerts, start=1):
-        arrow = "↑ above" if al.direction == "above" else "↓ below"
-        lines.append(f"{idx}. {al.symbol} – {arrow} {al.target:.2f}")
     return "\n".join(lines)
 
 
-def remove_alerts_for_symbol(chat_id: int, symbol: str) -> str:
-    alerts = ALERTS.get(chat_id, [])
-    if not alerts:
-        return "You have no active alerts."
+# -------------------------------------------------
+# TELEGRAM HANDLERS – BASIC
+# -------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "📈 *Swing Scanner Bot v3 – Advisor Mode*\n\n"
+        "Core commands:\n"
+        "/scan – Scan NIFTY 500 now\n"
+        "/alerts_on – 30-min realtime alerts\n"
+        "/alerts_off – Stop alerts\n"
+        "/daily_on – Daily morning report (9:15 IST)\n"
+        "/daily_off – Stop daily report\n"
+        "/gtt – Generate GTT CSV from latest scan\n"
+        "/chart SYMBOL – Price chart PNG (e.g. /chart BEL)\n\n"
+        "Advisor mode:\n"
+        "/explain SYMBOL – AI explanation of that stock's swing setup\n"
+        "/ai_scan – AI commentary on the latest scan\n"
+        "/ask your question – General swing-trading question (e.g. /ask How to size positions?)\n"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
-    before = len(alerts)
-    alerts = [al for al in alerts if al.symbol.upper() != symbol.upper()]
-    after = len(alerts)
 
-    if after == before:
-        return f"No alerts found for {symbol}."
-    ALERTS[chat_id] = alerts
-    return f"✅ Removed {before - after} alert(s) for {symbol}."
+async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Scanning NIFTY 500 for swing setups…")
 
+    results = await asyncio.to_thread(scan_universe)
 
-async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Periodic job: check all alerts for all chats.
-    If any alert condition is met, send a message and remove that alert.
-    """
-    if not ALERTS:
+    if not results:
+        await update.message.reply_text("No strong swing setups found right now.")
         return
 
-    # Collect all symbols we need prices for
-    symbols: Dict[str, float] = {}
-    for alerts in ALERTS.values():
-        for al in alerts:
-            symbols[al.symbol] = 0.0  # placeholder
+    # limit to first 20 for message length
+    lines = ["🔥 *Swing Trading Candidates*"]
+    for r in results[:20]:
+        lines.append(
+            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
+            f"Price: ₹{r['price']}\n"
+            f"Signals: {', '.join(r['signals'])}\n"
+            f"Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}"
+        )
 
-    # Fetch prices one-by-one (could be optimized to batch later)
-    prices: Dict[str, Optional[float]] = {}
-    for sym in symbols.keys():
-        prices[sym] = get_current_price(sym)
+    heatmap = build_sector_heatmap(results)
 
-    # Evaluate alerts
-    triggered: Dict[int, List[PriceAlert]] = {}
-
-    for chat_id, alerts in ALERTS.items():
-        for al in alerts:
-            price = prices.get(al.symbol)
-            if price is None:
-                continue
-            if al.direction == "above" and price >= al.target:
-                triggered.setdefault(chat_id, []).append(al)
-            elif al.direction == "below" and price <= al.target:
-                triggered.setdefault(chat_id, []).append(al)
-
-    # Notify and remove triggered alerts
-    for chat_id, trig_list in triggered.items():
-        # Build a nice message per chat
-        lines = ["🔔 Price alert(s) triggered:\n"]
-        for al in trig_list:
-            price = prices.get(al.symbol)
-            arrow = "↑" if al.direction == "above" else "↓"
-            lines.append(
-                f"• {al.symbol}: {arrow} target {al.target:.2f}, "
-                f"current {price:.2f if price is not None else 'N/A'}"
-            )
-
-        try:
-            await context.bot.send_message(chat_id=chat_id, text="\n".join(lines))
-        except Exception as e:
-            logger.exception("Error sending alert message to %s: %s", chat_id, e)
-
-        # Remove those alerts from the store
-        remaining = []
-        for al in ALERTS.get(chat_id, []):
-            if al not in trig_list:
-                remaining.append(al)
-        ALERTS[chat_id] = remaining
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text(heatmap, parse_mode="Markdown")
 
 
-# ============================================================
-#  TELEGRAM COMMAND HANDLERS
-# ============================================================
+# ------------------ ALERTS (30 MIN) -----------------
+async def alerts_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    job_name = f"alerts_{chat_id}"
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 Hi! I’m your Stock Analysis & Alerts Bot.\n\n"
-        "Commands:\n"
-        "• /fundamental SYMBOL – basic fundamental-style analysis\n"
-        "• /technical SYMBOL – simple technical view\n"
-        "• /news SYMBOL – latest news headlines\n"
-        "• /sentiment SYMBOL – sentiment based on recent news\n"
-        "• /alert SYMBOL PRICE – set a price alert\n"
-        "• /alerts – list your active alerts\n"
-        "• /removealert SYMBOL – remove all alerts for a symbol\n\n"
-        "Examples:\n"
-        "  /fundamental RELIANCE.NS\n"
-        "  /technical TCS.NS\n"
-        "  /news HDFCBANK.NS\n"
-        "  /sentiment INFY.NS\n"
-        "  /alert RELIANCE.NS 2700\n\n"
-        "Disclaimer: Information & education only, not investment advice. 📜"
+    # remove any old job first
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for j in current_jobs:
+        j.schedule_removal()
+
+    # 1800 seconds = 30 minutes
+    context.job_queue.run_repeating(
+        alerts_job,
+        interval=1800,
+        first=10,
+        chat_id=chat_id,
+        name=job_name,
     )
-    await update.message.reply_text(text)
+
+    await update.message.reply_text(
+        "✅ 30-minute alerts enabled for this chat.\n"
+        "You will receive swing candidates automatically."
+    )
 
 
-async def fundamental_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: /fundamental SYMBOL\nExample: /fundamental RELIANCE.NS"
-            )
-            return
+async def alerts_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    job_name = f"alerts_{chat_id}"
+    jobs = context.job_queue.get_jobs_by_name(job_name)
+    if not jobs:
+        await update.message.reply_text("No active alerts for this chat.")
+        return
+    for j in jobs:
+        j.schedule_removal()
+    await update.message.reply_text("⏹ Alerts turned off for this chat.")
 
-        symbol = context.args[0].upper()
-        await update.message.reply_text(f"🔍 Fetching data for {symbol}...")
 
-        snapshot = get_stock_snapshot(symbol)
-        data_text = "\n".join(f"{k}: {v}" for k, v in snapshot.items())
+async def alerts_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
 
-        system_prompt = (
-            "You are a stock market analysis assistant. "
-            "Explain things in simple, clear language. "
-            "Use only the data provided. "
-            "If some data points are missing, say they appear missing. "
-            "Focus on an educational, high-level fundamental view of the stock. "
-            "Always add a disclaimer that this is not investment advice."
+    results = await asyncio.to_thread(scan_universe)
+    if not results:
+        await context.bot.send_message(chat_id, text="⚠️ No swing setups this cycle.")
+        return
+
+    # send top 5
+    lines = ["⏰ *30-min Alert – New Swing Candidates*"]
+    for r in results[:5]:
+        lines.append(
+            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
+            f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
+            f"Signals: {', '.join(r['signals'])}"
         )
 
-        user_prompt = f"""
-Perform a basic fundamental-style analysis of this stock:
+    heatmap = build_sector_heatmap(results)
 
-Raw snapshot data:
-{data_text}
-
-Please cover, in simple terms:
-1. What kind of business this seems to be (based on name and sector/industry if available).
-2. Valuation hints using P/E, P/B, dividend yield if present.
-3. Price vs 52-week high/low.
-4. Any hints from moving averages (last_close vs ma20/ma50/ma200).
-5. A simple Bullish case (why someone might like it).
-6. A simple Bearish case (why someone might be cautious).
-
-Keep it under ~300–400 words.
-"""
-
-        answer = await ask_gpt(system_prompt, user_prompt)
-        await update.message.reply_text(answer)
-
-    except Exception as e:
-        logger.exception("Error in /fundamental handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /fundamental.")
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+    await context.bot.send_message(chat_id, heatmap, parse_mode="Markdown")
 
 
-async def technical_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: /technical SYMBOL\nExample: /technical TCS.NS"
-            )
-            return
+# ------------------ DAILY MORNING REPORT -----------------
+async def daily_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    job_name = f"daily_{chat_id}"
 
-        symbol = context.args[0].upper()
+    # remove any old jobs
+    for j in context.job_queue.get_jobs_by_name(job_name):
+        j.schedule_removal()
+
+    # schedule at 9:15 AM IST
+    report_time = dtime(hour=9, minute=15, tzinfo=ZoneInfo("Asia/Kolkata"))
+    context.job_queue.run_daily(
+        daily_job,
+        time=report_time,
+        chat_id=chat_id,
+        name=job_name,
+    )
+
+    await update.message.reply_text(
+        "🌅 Daily morning report enabled (around 9:15 AM IST)."
+    )
+
+
+async def daily_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    job_name = f"daily_{chat_id}"
+    jobs = context.job_queue.get_jobs_by_name(job_name)
+    if not jobs:
+        await update.message.reply_text("No daily report configured for this chat.")
+        return
+    for j in jobs:
+        j.schedule_removal()
+    await update.message.reply_text("🛑 Daily morning report disabled.")
+
+
+async def daily_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    chat_id = job.chat_id
+
+    results = await asyncio.to_thread(scan_universe)
+    if not results:
+        await context.bot.send_message(chat_id, "🌅 Daily report: No swing setups today.")
+        return
+
+    lines = ["🌅 *Daily Swing Report*"]
+    for r in results[:15]:
+        lines.append(
+            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
+            f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
+            f"Signals: {', '.join(r['signals'])}"
+        )
+
+    heatmap = build_sector_heatmap(results)
+
+    await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
+    await context.bot.send_message(chat_id, heatmap, parse_mode="Markdown")
+
+
+# ------------------ GTT FILE COMMAND -----------------
+async def gtt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LAST_SCAN_RESULTS
+    if not LAST_SCAN_RESULTS:
         await update.message.reply_text(
-            f"📊 Doing a simple technical view for {symbol}..."
+            "No cached scan results. Run /scan first to generate candidates."
+        )
+        return
+
+    filename = generate_gtt_file(LAST_SCAN_RESULTS)
+    if not filename or not os.path.exists(filename):
+        await update.message.reply_text("Failed to generate GTT file.")
+        return
+
+    with open(filename, "rb") as f:
+        await update.message.reply_document(
+            document=f,
+            filename=filename,
+            caption="📄 GTT order template generated from latest scan.",
         )
 
-        snapshot = get_stock_snapshot(symbol)
-        data_text = "\n".join(f"{k}: {v}" for k, v in snapshot.items())
 
-        system_prompt = (
-            "You are a technical analysis helper. "
-            "You are given basic price levels and moving averages. "
-            "Explain the trend in simple language. "
-            "Do NOT claim to predict the future. "
-            "This is not investment advice."
+# ------------------ CHART COMMAND -----------------
+async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /chart SYMBOL  (e.g. /chart BEL)")
+        return
+
+    symbol = context.args[0].upper()
+    await update.message.reply_text(f"Generating chart for {symbol}…")
+
+    fname = await asyncio.to_thread(create_price_chart, symbol)
+    if not fname or not os.path.exists(fname):
+        await update.message.reply_text("Could not generate chart. Try another symbol.")
+        return
+
+    with open(fname, "rb") as f:
+        await update.message.reply_photo(
+            photo=f,
+            caption=f"{symbol} – 6M price with SMA20/50",
         )
 
-        user_prompt = f"""
-Here is the technical snapshot for {snapshot['symbol']}:
 
-{data_text}
+# ------------------ ADVISOR COMMANDS -----------------
+async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /explain SYMBOL  (e.g. /explain BEL)")
+        return
 
-Using only this information, answer:
-1. Is the price closer to 52-week high or low?
-2. Is the price above or below its 20, 50, 200 day moving averages (when available)?
-3. What does that roughly suggest about short-term vs long-term trend?
-4. Provide 3–5 bullet points summarizing the technical picture.
+    symbol = context.args[0].upper()
+    symbol_full = symbol if symbol.endswith(".NS") else symbol + ".NS"
 
-Use simple language, no complicated jargon.
-"""
+    await update.message.reply_text(f"Running scan and AI explanation for {symbol}…")
 
-        answer = await ask_gpt(system_prompt, user_prompt)
-        await update.message.reply_text(answer)
+    analysis = await asyncio.to_thread(analyze_stock, symbol_full)
+    prompt = build_stock_prompt(symbol, analysis)
+    answer = await asyncio.to_thread(ai_generate, prompt)
 
-    except Exception as e:
-        logger.exception("Error in /technical handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /technical.")
+    await update.message.reply_text(answer)
 
 
-async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: /news SYMBOL\nExample: /news RELIANCE.NS"
-            )
-            return
+async def ai_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global LAST_SCAN_RESULTS
+    await update.message.reply_text("Asking AI to interpret the latest scan…")
 
-        symbol = context.args[0].upper()
-        items = get_news_for_symbol(symbol)
+    # Use cached results if available, else run a fresh scan
+    results = LAST_SCAN_RESULTS
+    if not results:
+        results = await asyncio.to_thread(scan_universe)
 
-        if not items:
-            await update.message.reply_text(f"No recent news found for {symbol}.")
-            return
-
-        lines = [f"📰 Latest news for *{symbol}*:\n"]
-        for item in items:
-            published = item["published"] or ""
-            lines.append(
-                f"• {item['title']}\n  {published}\n  {item['link']}\n"
-            )
-
-        await update.message.reply_markdown("\n".join(lines))
-
-    except Exception as e:
-        logger.exception("Error in /news handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /news.")
+    prompt = build_scan_prompt(results)
+    answer = await asyncio.to_thread(ai_generate, prompt)
+    await update.message.reply_text(answer)
 
 
-async def sentiment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: /sentiment SYMBOL\nExample: /sentiment INFY.NS"
-            )
-            return
+async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Capture the whole text after "/ask "
+    text = update.message.text or ""
+    parts = text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Usage: /ask your question here")
+        return
 
-        symbol = context.args[0].upper()
-        items = get_news_for_symbol(symbol, max_items=8)
+    question = parts[1].strip()
+    await update.message.reply_text("Thinking about that…")
 
-        if not items:
-            await update.message.reply_text(f"No recent news found for {symbol}.")
-            return
-
-        news_text_parts = []
-        for i, item in enumerate(items, start=1):
-            news_text_parts.append(
-                f"{i}. {item['title']} ({item['published']})\n{item['link']}"
-            )
-        news_text = "\n\n".join(news_text_parts)
-
-        system_prompt = (
-            "You are a sentiment analysis assistant for stocks. "
-            "Given a list of recent headlines, classify overall sentiment "
-            "as Positive, Negative, or Neutral for the stock. "
-            "Base it ONLY on the headlines and dates. "
-            "Explain your reasoning in simple terms and keep it concise. "
-            "Add a reminder that news sentiment can change quickly and "
-            "this is not investment advice."
-        )
-
-        user_prompt = f"""
-Recent news for stock {symbol}:
-
-{news_text}
-
-Tasks:
-1. Classify the overall sentiment as Positive, Negative, or Neutral.
-2. Give 3–6 bullet points explaining why.
-3. Mention if the impact feels more short-term or long-term.
-"""
-
-        answer = await ask_gpt(system_prompt, user_prompt)
-        await update.message.reply_text(answer)
-
-    except Exception as e:
-        logger.exception("Error in /sentiment handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /sentiment.")
+    prompt = (
+        "Answer this swing-trading / stock-market question for an Indian retail trader. "
+        "Be practical, conservative, and include risk notes.\n\n"
+        f"Question: {question}"
+    )
+    answer = await asyncio.to_thread(ai_generate, prompt)
+    await update.message.reply_text(answer)
 
 
-# ---------------- ALERT COMMANDS ----------------
+# -------------------------------------------------
+# MAIN
+# -------------------------------------------------
+async def main():
+    init_db()
 
-async def alert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /alert SYMBOL PRICE
-    Example: /alert RELIANCE.NS 2700
-    """
-    try:
-        if len(context.args) != 2:
-            await update.message.reply_text(
-                "Usage: /alert SYMBOL PRICE\nExample: /alert RELIANCE.NS 2700"
-            )
-            return
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-        symbol = context.args[0].upper()
-        try:
-            target = float(context.args[1])
-        except ValueError:
-            await update.message.reply_text("PRICE must be a number.")
-            return
-
-        chat_id = update.effective_chat.id
-        resp = add_price_alert(chat_id, symbol, target)
-        await update.message.reply_text(resp)
-
-    except Exception as e:
-        logger.exception("Error in /alert handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /alert.")
-
-
-async def alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /alerts – list active alerts for this chat
-    """
-    try:
-        chat_id = update.effective_chat.id
-        msg = list_alerts(chat_id)
-        await update.message.reply_text(msg)
-    except Exception as e:
-        logger.exception("Error in /alerts handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /alerts.")
-
-
-async def removealert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /removealert SYMBOL – remove all alerts for given symbol
-    """
-    try:
-        if not context.args:
-            await update.message.reply_text(
-                "Usage: /removealert SYMBOL\nExample: /removealert RELIANCE.NS"
-            )
-            return
-
-        symbol = context.args[0].upper()
-        chat_id = update.effective_chat.id
-        msg = remove_alerts_for_symbol(chat_id, symbol)
-        await update.message.reply_text(msg)
-    except Exception as e:
-        logger.exception("Error in /removealert handler: %s", e)
-        await update.message.reply_text("⚠️ Something went wrong in /removealert.")
-
-
-# ============================================================
-#  MAIN – EVENT LOOP & JOBS
-# ============================================================
-
-def main():
-    # If you're on 3.14, explicitly create and set an event loop.
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Commands
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("fundamental", fundamental_cmd))
-    app.add_handler(CommandHandler("technical", technical_cmd))
-    app.add_handler(CommandHandler("news", news_cmd))
-    app.add_handler(CommandHandler("sentiment", sentiment_cmd))
-    app.add_handler(CommandHandler("alert", alert_cmd))
-    app.add_handler(CommandHandler("alerts", alerts_cmd))
-    app.add_handler(CommandHandler("removealert", removealert_cmd))
+    app.add_handler(CommandHandler("scan", scan_cmd))
+    app.add_handler(CommandHandler("alerts_on", alerts_on))
+    app.add_handler(CommandHandler("alerts_off", alerts_off))
+    app.add_handler(CommandHandler("daily_on", daily_on))
+    app.add_handler(CommandHandler("daily_off", daily_off))
+    app.add_handler(CommandHandler("gtt", gtt_cmd))
+    app.add_handler(CommandHandler("chart", chart_cmd))
 
-    # Periodic job: check alerts every 60 seconds
-    job_queue = app.job_queue
-    job_queue.run_repeating(check_alerts_job, interval=60, first=15)
+    # Advisor commands
+    app.add_handler(CommandHandler("explain", explain_cmd))
+    app.add_handler(CommandHandler("ai_scan", ai_scan_cmd))
+    app.add_handler(CommandHandler("ask", ask_cmd))
 
-    logger.info("Bot starting with alerts enabled…")
-    app.run_polling()
+    print("Bot is running with scanner + alerts + daily + charts + GTT + DB + advisor mode…")
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
