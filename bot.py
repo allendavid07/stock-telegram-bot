@@ -5,18 +5,22 @@ from zoneinfo import ZoneInfo
 import os
 import sqlite3
 
-
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
 
 from openai import OpenAI
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
 )
 
 # -------------------------------------------------
@@ -24,24 +28,32 @@ from telegram.ext import (
 # -------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
 
 # -------------------------------------------------
 # CONFIG
 # -------------------------------------------------
-# Prefer environment variables for cloud deployment
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN or TELEGRAM_BOT_TOKEN in the environment first.")
 
+# Restrict bot to a single owner (chat id)
+# Default to your id, but can be overridden via env var
+ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "8116729026"))
 
 JOURNAL_FILE = "swing_journal.csv"
-DB_FILE = "swing_signals.db"
+DB_FILE = os.getenv("DB_FILE", "swing_signals.db")
 NIFTY500_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
+
+# Risk-based sizing
+DEFAULT_CAPITAL = float(os.getenv("DEFAULT_CAPITAL", "4000"))
+RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% per trade
+RISK_PERCENT = int(RISK_PER_TRADE * 100)
 
 NIFTY500_DF = None
 NIFTY500_SYMBOLS = []
@@ -52,8 +64,47 @@ client = None
 if OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
 
+
+# Small helper so we can reuse handlers from the UI panel
+class DummyUpdate:
+    def __init__(self, message):
+        self.message = message
+
+
 # -------------------------------------------------
-# DB INIT
+# ACCESS CONTROL
+# -------------------------------------------------
+async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Ensure only the configured owner can use the bot.
+    Returns True if allowed, False otherwise.
+    """
+    if not ALLOWED_CHAT_ID:
+        # No restriction configured
+        return True
+
+    chat = update.effective_chat
+    if chat is None:
+        return False
+
+    chat_id = chat.id
+    if chat_id != ALLOWED_CHAT_ID:
+        # Try to notify the other user once
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "🚫 This bot is restricted to its owner and cannot be used from this chat.",
+            )
+        except Exception:
+            pass
+        logger.warning("Blocked access from chat_id=%s", chat_id)
+        return False
+
+    return True
+
+
+# -------------------------------------------------
+# DB INIT (cloud-friendly SQLite)
 # -------------------------------------------------
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -118,6 +169,19 @@ def compute_rsi(series, period=14):
 
 
 # -------------------------------------------------
+# RISK-BASED POSITION SIZING
+# -------------------------------------------------
+def calc_position_size(price: float, stoploss: float) -> int:
+    """Simple fixed-fraction risk model based on DEFAULT_CAPITAL & RISK_PER_TRADE."""
+    risk_per_share = max(price - stoploss, 0.01)
+    risk_amount = DEFAULT_CAPITAL * RISK_PER_TRADE
+    qty = int(risk_amount // risk_per_share)
+    if qty < 0:
+        qty = 0
+    return qty
+
+
+# -------------------------------------------------
 # CORE – ANALYSE SINGLE STOCK
 # -------------------------------------------------
 def analyze_stock(symbol):
@@ -175,7 +239,7 @@ def analyze_stock(symbol):
 # JOURNAL LOGGING (CSV + SQLite)
 # -------------------------------------------------
 def log_journal(entry):
-    # CSV
+    # CSV (basic log)
     df = pd.DataFrame([entry])
     try:
         if os.path.exists(JOURNAL_FILE):
@@ -185,7 +249,7 @@ def log_journal(entry):
         logger.warning("Error reading journal CSV: %s", e)
     df.to_csv(JOURNAL_FILE, index=False)
 
-    # SQLite
+    # SQLite (for dashboards)
     try:
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
@@ -242,6 +306,7 @@ def scan_universe():
         )
 
     LAST_SCAN_RESULTS = results
+    logger.info("Scan complete. %d candidates.", len(results))
     return results
 
 
@@ -264,6 +329,39 @@ def build_sector_heatmap(results):
         bar = "🟩" * min(count, 10)
         lines.append(f"{sector}: {bar} ({count})")
 
+    return "\n".join(lines)
+
+
+# -------------------------------------------------
+# SENTIMENT / MOOD SCAN
+# -------------------------------------------------
+def build_sentiment_summary(results):
+    n = len(results)
+    if n == 0:
+        return "😴 *Scanner Sentiment:* Quiet market for clean swing setups. Patience > forcing trades."
+
+    sectors = {r.get("industry", "Unknown") for r in results}
+    sector_count = len(sectors)
+
+    if n < 10:
+        mood = "Selective / early activity"
+        style = "Pick only the cleanest setups, keep risk per trade tight."
+    elif n < 30:
+        mood = "Constructive / active"
+        style = "Conditions are reasonable for swing trades, but still respect stops."
+    elif n < 60:
+        mood = "Hot / crowded"
+        style = "Plenty of action – avoid FOMO entries and control position sizes."
+    else:
+        mood = "Overheated"
+        style = "Too many signals can mean late-stage moves; focus on capital protection."
+
+    lines = [
+        "🧠 *Scanner Sentiment*",
+        f"Candidates: *{n}* across *{sector_count}* sectors.",
+        f"Mood: *{mood}*.",
+        style,
+    ]
     return "\n".join(lines)
 
 
@@ -415,34 +513,60 @@ def build_scan_prompt(results: list[dict]):
 # TELEGRAM HANDLERS – BASIC
 # -------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
+    chat_id = update.message.chat_id
+
+    # Auto-enable daily report at 9:15 AM IST for this chat
+    job_name = f"daily_{chat_id}"
+    for j in context.job_queue.get_jobs_by_name(job_name):
+        j.schedule_removal()
+
+    report_time = dtime(hour=9, minute=15, tzinfo=ZoneInfo("Asia/Kolkata"))
+    context.job_queue.run_daily(
+        daily_job,
+        time=report_time,
+        chat_id=chat_id,
+        name=job_name,
+    )
+
     msg = (
         "<b>📈 Swing Scanner Bot v3 – Advisor Mode</b>\n\n"
         "<b>What I can do for you:</b>\n"
         "• Scan NIFTY 500 for swing setups\n"
         "• Send 30-min alerts for your watchlist\n"
         "• Generate auto-GTT order files\n"
-        "• Give daily morning summaries\n"
+        "• Daily morning suggestions at ~9:15 AM IST\n"
         "• Create PNG charts for each stock\n"
-        "• Log everything into SQLite so you can review later\n\n"
+        "• Log everything into a cloud-friendly DB for dashboards\n\n"
         "<b>Core commands:</b>\n"
         "/scan – Scan NIFTY 500 now\n"
-        "/alerts – Show/refresh alert configuration\n"
+        "/summary – Quick overview + heatmap + sentiment\n"
+        "/alerts_on – 30-min alerts ON\n"
+        "/alerts_off – 30-min alerts OFF\n"
+        "/daily_on – Daily report ON\n"
+        "/daily_off – Daily report OFF\n"
         "/gtt – Generate GTT order CSV\n"
-        "/daily – Force-send today’s morning report\n"
-        "/chart SYMBOL – Price chart PNG (e.g. /chart BEL)\n\n"
+        "/chart SYMBOL – Price chart PNG (e.g. /chart BEL)\n"
+        "/panel – UI control panel\n"
+        "/dash – Logging dashboard from DB\n"
+        "/cmds – List all commands\n\n"
         "<b>Advisor mode:</b>\n"
-        "Just type a normal message like:\n"
-        "\"Can I swing trade BEL for 3–5 days with capital 4000?\"\n"
-        "and I’ll analyse risk, levels and give a plan.\n\n"
-        "<i>Bot is live in the cloud – scanner + alerts + daily + charts + GTT + DB + advisor mode.</i>\n"
-        "Let’s hunt for clean swing setups. 🔍📊"
+        "/explain SYMBOL – AI explanation of a stock\n"
+        "/ai_scan – AI interpretation of latest scan\n"
+        "/ask … – Any swing/market question\n\n"
+        "<i>Daily suggestions are now scheduled for this chat at 9:15 AM (IST). "
+        "Trade safe, focus on risk first.</i>\n"
     )
 
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
-
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     await update.message.reply_text("🔍 Scanning NIFTY 500 for swing setups…")
 
     results = await asyncio.to_thread(scan_universe)
@@ -451,24 +575,30 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No strong swing setups found right now.")
         return
 
-    # limit to first 20 for message length
     lines = ["🔥 *Swing Trading Candidates*"]
     for r in results[:20]:
+        pos = calc_position_size(r["price"], r["stoploss"])
         lines.append(
             f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
             f"Price: ₹{r['price']}\n"
             f"Signals: {', '.join(r['signals'])}\n"
-            f"Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}"
+            f"Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
+            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
         )
 
     heatmap = build_sector_heatmap(results)
+    sentiment = build_sentiment_summary(results)
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     await update.message.reply_text(heatmap, parse_mode="Markdown")
+    await update.message.reply_text(sentiment, parse_mode="Markdown")
 
 
 # ------------------ ALERTS (30 MIN) -----------------
 async def alerts_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     chat_id = update.message.chat_id
     job_name = f"alerts_{chat_id}"
 
@@ -493,6 +623,9 @@ async def alerts_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def alerts_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     chat_id = update.message.chat_id
     job_name = f"alerts_{chat_id}"
     jobs = context.job_queue.get_jobs_by_name(job_name)
@@ -508,6 +641,10 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
 
+    # Enforce owner-only even for scheduled jobs
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return
+
     results = await asyncio.to_thread(scan_universe)
     if not results:
         await context.bot.send_message(chat_id, text="⚠️ No swing setups this cycle.")
@@ -516,20 +653,27 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE):
     # send top 5
     lines = ["⏰ *30-min Alert – New Swing Candidates*"]
     for r in results[:5]:
+        pos = calc_position_size(r["price"], r["stoploss"])
         lines.append(
             f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
             f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"Signals: {', '.join(r['signals'])}"
+            f"Signals: {', '.join(r['signals'])}\n"
+            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
         )
 
     heatmap = build_sector_heatmap(results)
+    sentiment = build_sentiment_summary(results)
 
     await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
     await context.bot.send_message(chat_id, heatmap, parse_mode="Markdown")
+    await context.bot.send_message(chat_id, sentiment, parse_mode="Markdown")
 
 
 # ------------------ DAILY MORNING REPORT -----------------
 async def daily_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     chat_id = update.message.chat_id
     job_name = f"daily_{chat_id}"
 
@@ -552,6 +696,9 @@ async def daily_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def daily_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     chat_id = update.message.chat_id
     job_name = f"daily_{chat_id}"
     jobs = context.job_queue.get_jobs_by_name(job_name)
@@ -567,27 +714,43 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
 
+    # Enforce owner-only even for scheduled jobs
+    if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
+        return
+
     results = await asyncio.to_thread(scan_universe)
     if not results:
         await context.bot.send_message(chat_id, "🌅 Daily report: No swing setups today.")
         return
 
-    lines = ["🌅 *Daily Swing Report*"]
+    lines = ["🌅 *Daily Swing Suggestions*"]
     for r in results[:15]:
+        pos = calc_position_size(r["price"], r["stoploss"])
         lines.append(
             f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
             f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"Signals: {', '.join(r['signals'])}"
+            f"Signals: {', '.join(r['signals'])}\n"
+            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
         )
 
     heatmap = build_sector_heatmap(results)
+    sentiment = build_sentiment_summary(results)
 
     await context.bot.send_message(chat_id, "\n".join(lines), parse_mode="Markdown")
     await context.bot.send_message(chat_id, heatmap, parse_mode="Markdown")
+    await context.bot.send_message(chat_id, sentiment, parse_mode="Markdown")
+
+    # Extra AI reasoning on the day
+    prompt = build_scan_prompt(results)
+    ai_text = await asyncio.to_thread(ai_generate, prompt)
+    await context.bot.send_message(chat_id, ai_text)
 
 
 # ------------------ GTT FILE COMMAND -----------------
 async def gtt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     global LAST_SCAN_RESULTS
     if not LAST_SCAN_RESULTS:
         await update.message.reply_text(
@@ -610,6 +773,9 @@ async def gtt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ CHART COMMAND -----------------
 async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     if not context.args:
         await update.message.reply_text("Usage: /chart SYMBOL  (e.g. /chart BEL)")
         return
@@ -631,6 +797,9 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ ADVISOR COMMANDS -----------------
 async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     if not context.args:
         await update.message.reply_text("Usage: /explain SYMBOL  (e.g. /explain BEL)")
         return
@@ -648,6 +817,9 @@ async def explain_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ai_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     global LAST_SCAN_RESULTS
     await update.message.reply_text("Asking AI to interpret the latest scan…")
 
@@ -662,6 +834,9 @@ async def ai_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     # Capture the whole text after "/ask "
     text = update.message.text or ""
     parts = text.split(" ", 1)
@@ -680,8 +855,12 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = await asyncio.to_thread(ai_generate, prompt)
     await update.message.reply_text(answer)
 
+
 # ------------------ SUMMARY COMMAND -----------------
 async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
     """
     Quick summary of the latest swing scan.
     Uses cached LAST_SCAN_RESULTS if available, otherwise runs a fresh scan.
@@ -712,16 +891,163 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Top 5 by scan order:",
     ]
     for r in results[:5]:
+        pos = calc_position_size(r["price"], r["stoploss"])
         lines.append(
             f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
             f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"Signals: {', '.join(r['signals'])}"
+            f"Signals: {', '.join(r['signals'])}\n"
+            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
         )
 
     heatmap = build_sector_heatmap(results)
+    sentiment = build_sentiment_summary(results)
 
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     await update.message.reply_text(heatmap, parse_mode="Markdown")
+    await update.message.reply_text(sentiment, parse_mode="Markdown")
+
+
+# ------------------ LOGGING DASHBOARD -----------------
+async def dash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
+    await update.message.reply_text("📊 Building logging dashboard from DB…")
+
+    if not os.path.exists(DB_FILE):
+        await update.message.reply_text("No DB file found yet. Run a scan first.")
+        return
+
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql_query(
+            "SELECT ts, symbol, industry FROM signals ORDER BY ts DESC LIMIT 2000",
+            conn,
+        )
+        conn.close()
+    except Exception as e:
+        logger.warning("Error reading DB for dashboard: %s", e)
+        await update.message.reply_text("Failed to read DB for dashboard.")
+        return
+
+    if df.empty:
+        await update.message.reply_text("DB is empty – no logged signals yet.")
+        return
+
+    df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
+    df["date"] = df["ts"].dt.date
+
+    # Last 5 days of activity
+    unique_dates = sorted(df["date"].dropna().unique())
+    last_dates = unique_dates[-5:] if len(unique_dates) > 5 else unique_dates
+    by_day = df[df["date"].isin(last_dates)].groupby("date")["symbol"].nunique()
+
+    # Top sectors
+    by_sector = (
+        df.groupby("industry")["symbol"].nunique().sort_values(ascending=False).head(10)
+    )
+
+    total_rows = len(df)
+
+    lines = ["📊 *Logging Dashboard*"]
+    lines.append("\nRecent activity (unique symbols per day):")
+    for d, cnt in by_day.items():
+        lines.append(f"- {d}: {cnt} symbols")
+
+    lines.append("\nTop sectors by logged symbols:")
+    for sector, cnt in by_sector.items():
+        lines.append(f"- {sector}: {cnt}")
+
+    lines.append(f"\nTotal logged rows in DB (sampled): *{total_rows}*")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+# ------------------ UI PANEL (INLINE KEYBOARD) -----------------
+async def panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🔍 Scan Now", callback_data="panel_scan"),
+            InlineKeyboardButton("📋 Summary", callback_data="panel_summary"),
+        ],
+        [
+            InlineKeyboardButton("🤖 AI Scan", callback_data="panel_ai_scan"),
+            InlineKeyboardButton("📊 Dashboard", callback_data="panel_dash"),
+        ],
+        [
+            InlineKeyboardButton("🌅 Daily ON", callback_data="panel_daily_on"),
+            InlineKeyboardButton("🛑 Daily OFF", callback_data="panel_daily_off"),
+        ],
+        [
+            InlineKeyboardButton("⏰ Alerts ON", callback_data="panel_alerts_on"),
+            InlineKeyboardButton("⏹ Alerts OFF", callback_data="panel_alerts_off"),
+        ],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Control panel:", reply_markup=reply_markup)
+
+
+async def panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    dummy_update = DummyUpdate(query.message)
+
+    if data == "panel_scan":
+        await scan_cmd(dummy_update, context)
+    elif data == "panel_summary":
+        await summary_cmd(dummy_update, context)
+    elif data == "panel_ai_scan":
+        await ai_scan_cmd(dummy_update, context)
+    elif data == "panel_dash":
+        await dash_cmd(dummy_update, context)
+    elif data == "panel_daily_on":
+        await daily_on(dummy_update, context)
+    elif data == "panel_daily_off":
+        await daily_off(dummy_update, context)
+    elif data == "panel_alerts_on":
+        await alerts_on(dummy_update, context)
+    elif data == "panel_alerts_off":
+        await alerts_off(dummy_update, context)
+    else:
+        await query.message.reply_text("Unknown panel action.")
+
+
+# ------------------ COMMAND LIST (/cmds) -----------------
+async def cmds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await ensure_allowed(update, context):
+        return
+
+    msg = (
+        "<b>📚 Command Reference</b>\n\n"
+        "<b>Core</b>\n"
+        "/start – Initialise bot & auto-schedule daily 9:15 AM report\n"
+        "/scan – Scan NIFTY 500 for swing setups now\n"
+        "/summary – Compact summary + heatmap + sentiment\n"
+        "/panel – Open inline control panel\n"
+        "/dash – Show logging dashboard from DB\n\n"
+        "<b>Automation</b>\n"
+        "/alerts_on – Enable 30-min repeating alerts\n"
+        "/alerts_off – Disable 30-min alerts\n"
+        "/daily_on – Enable daily 9:15 AM suggestions\n"
+        "/daily_off – Disable daily morning suggestions\n\n"
+        "<b>Orders & Charts</b>\n"
+        "/gtt – Generate GTT order CSV from last scan\n"
+        "/chart SYMBOL – 6M price chart with SMA20/50 (e.g. /chart BEL)\n\n"
+        "<b>Advisor / AI</b>\n"
+        "/explain SYMBOL – AI explanation based on scanner (e.g. /explain BEL)\n"
+        "/ai_scan – AI interpretation of latest scan\n"
+        "/ask question… – Ask any swing/market question\n\n"
+        "<i>Note:</i> This bot is locked to the owner account and is for educational use only."
+    )
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 
 # -------------------------------------------------
@@ -741,14 +1067,22 @@ def main():
     app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("gtt", gtt_cmd))
     app.add_handler(CommandHandler("chart", chart_cmd))
+    app.add_handler(CommandHandler("dash", dash_cmd))
+    app.add_handler(CommandHandler("panel", panel_cmd))
+    app.add_handler(CommandHandler("cmds", cmds_cmd))
 
     # Advisor commands
     app.add_handler(CommandHandler("explain", explain_cmd))
     app.add_handler(CommandHandler("ai_scan", ai_scan_cmd))
     app.add_handler(CommandHandler("ask", ask_cmd))
 
-    print("Bot is running with scanner + alerts + daily + charts + GTT + DB + advisor mode…")
-    app.run_polling()   # <-- NOTE: no await, no asyncio.run
+    # UI panel callbacks
+    app.add_handler(CallbackQueryHandler(panel_callback, pattern="^panel_"))
+
+    print(
+        "Bot is running with scanner + alerts + daily + charts + GTT + DB + advisor mode + dashboards + panel…"
+    )
+    app.run_polling()
 
 
 if __name__ == "__main__":
