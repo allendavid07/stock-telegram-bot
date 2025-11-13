@@ -673,7 +673,7 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------------------------------------
 # MAIN
 # -------------------------------------------------
-async def main():
+def main():
     init_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -684,6 +684,7 @@ async def main():
     app.add_handler(CommandHandler("alerts_off", alerts_off))
     app.add_handler(CommandHandler("daily_on", daily_on))
     app.add_handler(CommandHandler("daily_off", daily_off))
+    app.add_handler(CommandHandler("summary", summary_cmd))
     app.add_handler(CommandHandler("gtt", gtt_cmd))
     app.add_handler(CommandHandler("chart", chart_cmd))
 
@@ -693,8 +694,8 @@ async def main():
     app.add_handler(CommandHandler("ask", ask_cmd))
 
     print("Bot is running with scanner + alerts + daily + charts + GTT + DB + advisor mode…")
-    await app.run_polling()
+    app.run_polling()   # <-- NOTE: no await, no asyncio.run
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
