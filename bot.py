@@ -43,7 +43,6 @@ if not BOT_TOKEN:
     raise RuntimeError("Set BOT_TOKEN or TELEGRAM_BOT_TOKEN in the environment first.")
 
 # Restrict bot to a single owner (chat id)
-# Default to your id, but can be overridden via env var
 ALLOWED_CHAT_ID = int(os.getenv("ALLOWED_CHAT_ID", "8116729026"))
 
 JOURNAL_FILE = "swing_journal.csv"
@@ -56,8 +55,8 @@ RISK_PER_TRADE = float(os.getenv("RISK_PER_TRADE", "0.01"))  # 1% per trade
 RISK_PERCENT = int(RISK_PER_TRADE * 100)
 
 NIFTY500_DF = None
-NIFTY500_SYMBOLS = []
-LAST_SCAN_RESULTS = []  # cached latest scan results
+NIFTY500_SYMBOLS: list[str] = []
+LAST_SCAN_RESULTS: list[dict] = []
 
 # OpenAI client (advisor mode)
 client = None
@@ -65,8 +64,9 @@ if OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
 
 
-# Small helper so we can reuse handlers from the UI panel
 class DummyUpdate:
+    """Tiny wrapper so panel buttons can reuse normal handlers."""
+
     def __init__(self, message):
         self.message = message
 
@@ -80,7 +80,6 @@ async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     Returns True if allowed, False otherwise.
     """
     if not ALLOWED_CHAT_ID:
-        # No restriction configured
         return True
 
     chat = update.effective_chat
@@ -89,7 +88,6 @@ async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     chat_id = chat.id
     if chat_id != ALLOWED_CHAT_ID:
-        # Try to notify the other user once
         try:
             await context.bot.send_message(
                 chat_id,
@@ -203,35 +201,65 @@ def format_candidate_block(r: dict) -> str:
 
 
 # -------------------------------------------------
-# CORE – ANALYSE SINGLE STOCK
+# CORE – ANALYSE SINGLE STOCK (FIXED)
 # -------------------------------------------------
 def analyze_stock(symbol):
     try:
-        data = yf.download(symbol, period="6mo", interval="1d", progress=False)
+        # Explicit auto_adjust to avoid FutureWarning
+        data = yf.download(
+            symbol,
+            period="6mo",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
         if data is None or data.empty or len(data) < 50:
             return None
 
-        data["SMA20"] = data["Close"].rolling(20).mean()
-        data["SMA50"] = data["Close"].rolling(50).mean()
-        data["RSI"] = compute_rsi(data["Close"])
+        close = data["Close"]
+        data["SMA20"] = close.rolling(20).mean()
+        data["SMA50"] = close.rolling(50).mean()
+        data["RSI"] = compute_rsi(close)
 
         last = data.iloc[-1]
         prev = data.iloc[-2]
 
-        price = float(last["Close"])
-        signals = []
+        # Avoid FutureWarning by using close series directly
+        price = float(close.iloc[-1])
+        signals: list[str] = []
+
+        sma20_last = last["SMA20"]
+        sma50_last = last["SMA50"]
+        sma20_prev = prev["SMA20"]
+        sma50_prev = prev["SMA50"]
+        rsi_last = last["RSI"]
+
+        # --- Signals with NaN guards (avoid ambiguous Series truth) ---
 
         # Bullish SMA crossover
-        if last["SMA20"] > last["SMA50"] and prev["SMA20"] <= prev["SMA50"]:
+        if (
+            pd.notna(sma20_last)
+            and pd.notna(sma50_last)
+            and pd.notna(sma20_prev)
+            and pd.notna(sma50_prev)
+            and sma20_last > sma50_last
+            and sma20_prev <= sma50_prev
+        ):
             signals.append("Bullish SMA20/50 Crossover")
 
         # RSI oversold
-        if last["RSI"] < 35:
+        if pd.notna(rsi_last) and rsi_last < 35:
             signals.append("RSI Oversold (<35)")
 
         # Volume spike
+        vol_last = last["Volume"]
         vol_mean = data["Volume"].tail(20).mean()
-        if last["Volume"] > 1.8 * vol_mean:
+        if (
+            pd.notna(vol_last)
+            and pd.notna(vol_mean)
+            and vol_mean > 0
+            and vol_last > 1.8 * vol_mean
+        ):
             signals.append("Volume Spike (>1.8x 20D avg)")
 
         if not signals:
@@ -303,7 +331,7 @@ def scan_universe():
     global LAST_SCAN_RESULTS
     symbols = load_nifty500()
 
-    results = []
+    results: list[dict] = []
     for symbol in symbols:
         stock_data = analyze_stock(symbol)
         if not stock_data:
@@ -338,7 +366,7 @@ def build_sector_heatmap(results):
     if not results:
         return "No sector data – no candidates today."
 
-    sector_counts = {}
+    sector_counts: dict[str, int] = {}
     for r in results:
         sector = r.get("industry", "Unknown")
         sector_counts[sector] = sector_counts.get(sector, 0) + 1
@@ -413,7 +441,7 @@ def generate_gtt_file(results, quantity=1, filename="gtt_orders.csv"):
 
 
 # -------------------------------------------------
-# CHART GENERATION
+# CHART GENERATION (FIXED auto_adjust)
 # -------------------------------------------------
 def create_price_chart(symbol: str):
     # symbol can be "BEL" or "BEL.NS"
@@ -422,7 +450,13 @@ def create_price_chart(symbol: str):
     else:
         symbol_full = symbol.upper()
 
-    data = yf.download(symbol_full, period="6mo", interval="1d", progress=False)
+    data = yf.download(
+        symbol_full,
+        period="6mo",
+        interval="1d",
+        progress=False,
+        auto_adjust=False,
+    )
     if data is None or data.empty:
         return None
 
@@ -446,7 +480,7 @@ def create_price_chart(symbol: str):
 
 
 # -------------------------------------------------
-# BASIC PRICE / SINGLE-STOCK UTILS
+# BASIC PRICE / SINGLE-STOCK UTILS (FIXED auto_adjust)
 # -------------------------------------------------
 def get_price_snapshot(symbol: str):
     """Basic price + daily change + 1Y range using yfinance."""
@@ -456,7 +490,13 @@ def get_price_snapshot(symbol: str):
         symbol_full = symbol.upper()
 
     try:
-        data_5d = yf.download(symbol_full, period="5d", interval="1d", progress=False)
+        data_5d = yf.download(
+            symbol_full,
+            period="5d",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
         if data_5d is None or data_5d.empty:
             return None
 
@@ -464,14 +504,20 @@ def get_price_snapshot(symbol: str):
         price = float(last["Close"])
 
         if len(data_5d) > 1:
-            prev = data_5d.iloc[-2]["Close"]
-            change = price - float(prev)
-            pct = (change / float(prev)) * 100
+            prev = float(data_5d.iloc[-2]["Close"])
+            change = price - prev
+            pct = (change / prev) * 100
         else:
             change = 0.0
             pct = 0.0
 
-        data_1y = yf.download(symbol_full, period="1y", interval="1d", progress=False)
+        data_1y = yf.download(
+            symbol_full,
+            period="1y",
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+        )
         if data_1y is None or data_1y.empty:
             low_52w = high_52w = price
         else:
@@ -557,7 +603,6 @@ def build_scan_prompt(results: list[dict]):
             "about capital protection and patience."
         )
 
-    # Top 10 only to keep prompt small
     subset = results[:10]
     lines = ["Swing scanner results (subset):"]
     for r in subset:
@@ -607,7 +652,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Show basic price, daily change, 1Y range\n"
         "• Send 30-min alerts for your watchlist\n"
         "• Generate auto-GTT order files\n"
-        "• Daily morning suggestions at ~9:15 AM IST\n"
+        "• Daily morning report around 9:15 AM IST\n"
         "• Create PNG charts for each stock\n"
         "• Log everything into a cloud-friendly DB for dashboards\n\n"
         "<b>Core commands:</b>\n"
@@ -719,7 +764,6 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id, text="⚠️ No swing setups this cycle.")
         return
 
-    # send top 5
     lines = ["⏰ *30-min Alert – New Swing Candidates*"]
     for r in results[:5]:
         lines.append(format_candidate_block(r))
@@ -744,11 +788,9 @@ async def daily_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     job_name = f"daily_{chat_id}"
 
-    # remove any old jobs
     for j in context.job_queue.get_jobs_by_name(job_name):
         j.schedule_removal()
 
-    # schedule at 9:15 AM IST
     report_time = dtime(hour=9, minute=15, tzinfo=ZoneInfo("Asia/Kolkata"))
     context.job_queue.run_daily(
         daily_job,
@@ -781,7 +823,6 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
 
-    # Enforce owner-only even for scheduled jobs
     if ALLOWED_CHAT_ID and chat_id != ALLOWED_CHAT_ID:
         return
 
@@ -805,7 +846,6 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id, heatmap, parse_mode="Markdown")
     await context.bot.send_message(chat_id, sentiment, parse_mode="Markdown")
 
-    # Extra AI reasoning on the day
     prompt = build_scan_prompt(results)
     ai_text = await asyncio.to_thread(ai_generate, prompt)
     await context.bot.send_message(chat_id, ai_text)
@@ -912,7 +952,6 @@ async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     analysis = await asyncio.to_thread(analyze_stock, symbol_full)
 
-    # Always try to show price snapshot so the command is useful even without signals
     snap = await asyncio.to_thread(get_price_snapshot, symbol)
     if snap is None and analysis is None:
         await update.message.reply_text(
@@ -987,7 +1026,6 @@ async def ai_scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LAST_SCAN_RESULTS
     await update.message.reply_text("Asking AI to interpret the latest scan…")
 
-    # Use cached results if available, else run a fresh scan
     results = LAST_SCAN_RESULTS
     if not results:
         results = await asyncio.to_thread(scan_universe)
@@ -1001,7 +1039,6 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update, context):
         return
 
-    # Capture the whole text after "/ask "
     text = update.message.text or ""
     parts = text.split(" ", 1)
     if len(parts) < 2 or not parts[1].strip():
@@ -1025,17 +1062,12 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update, context):
         return
 
-    """
-    Quick summary of the latest swing scan.
-    Uses cached LAST_SCAN_RESULTS if available, otherwise runs a fresh scan.
-    """
     global LAST_SCAN_RESULTS
 
     await update.message.reply_text("📋 Building swing summary…")
 
     results = LAST_SCAN_RESULTS
     if not results:
-        # No cached results – run a fresh scan
         results = await asyncio.to_thread(scan_universe)
 
     if not results:
@@ -1046,7 +1078,6 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sectors = {r.get("industry", "Unknown") for r in results}
     sector_count = len(sectors)
 
-    # Top 5 for a compact view
     lines = [
         "📋 *Swing Summary*",
         f"Total candidates: *{total}*",
@@ -1099,12 +1130,10 @@ async def dash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     df["ts"] = pd.to_datetime(df["ts"], errors="coerce")
     df["date"] = df["ts"].dt.date
 
-    # Last 5 days of activity
     unique_dates = sorted(df["date"].dropna().unique())
     last_dates = unique_dates[-5:] if len(unique_dates) > 5 else unique_dates
     by_day = df[df["date"].isin(last_dates)].groupby("date")["symbol"].nunique()
 
-    # Top sectors
     by_sector = (
         df.groupby("industry")["symbol"].nunique().sort_values(ascending=False).head(10)
     )
@@ -1236,7 +1265,7 @@ def main():
     app.add_handler(CommandHandler("panel", panel_cmd))
     app.add_handler(CommandHandler("cmds", cmds_cmd))
 
-    # New basic trader utilities
+    # Basic trader utilities
     app.add_handler(CommandHandler("price", price_cmd))
     app.add_handler(CommandHandler("stock", stock_cmd))
 
