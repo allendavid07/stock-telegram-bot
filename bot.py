@@ -181,6 +181,27 @@ def calc_position_size(price: float, stoploss: float) -> int:
     return qty
 
 
+def calc_rr_ratio(buy: float, target: float, stoploss: float) -> float:
+    """Approximate reward:risk ratio."""
+    reward = max(target - buy, 0.0)
+    risk = max(buy - stoploss, 0.01)
+    return round(reward / risk, 2)
+
+
+def format_candidate_block(r: dict) -> str:
+    """Reusable formatting for scanner-style outputs."""
+    pos = calc_position_size(r["price"], r["stoploss"])
+    rr = calc_rr_ratio(r["buy"], r["target"], r["stoploss"])
+    return (
+        f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
+        f"Price: ₹{r['price']}\n"
+        f"Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
+        f"Signals: {', '.join(r['signals'])}\n"
+        f"🎯 R:R ≈ {rr}:1\n"
+        f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
+    )
+
+
 # -------------------------------------------------
 # CORE – ANALYSE SINGLE STOCK
 # -------------------------------------------------
@@ -425,6 +446,53 @@ def create_price_chart(symbol: str):
 
 
 # -------------------------------------------------
+# BASIC PRICE / SINGLE-STOCK UTILS
+# -------------------------------------------------
+def get_price_snapshot(symbol: str):
+    """Basic price + daily change + 1Y range using yfinance."""
+    if not symbol.upper().endswith(".NS"):
+        symbol_full = symbol.upper() + ".NS"
+    else:
+        symbol_full = symbol.upper()
+
+    try:
+        data_5d = yf.download(symbol_full, period="5d", interval="1d", progress=False)
+        if data_5d is None or data_5d.empty:
+            return None
+
+        last = data_5d.iloc[-1]
+        price = float(last["Close"])
+
+        if len(data_5d) > 1:
+            prev = data_5d.iloc[-2]["Close"]
+            change = price - float(prev)
+            pct = (change / float(prev)) * 100
+        else:
+            change = 0.0
+            pct = 0.0
+
+        data_1y = yf.download(symbol_full, period="1y", interval="1d", progress=False)
+        if data_1y is None or data_1y.empty:
+            low_52w = high_52w = price
+        else:
+            low_52w = float(data_1y["Close"].min())
+            high_52w = float(data_1y["Close"].max())
+
+        return {
+            "symbol": symbol.upper(),
+            "symbol_full": symbol_full,
+            "price": round(price, 2),
+            "change": round(change, 2),
+            "pct": round(pct, 2),
+            "low_52w": round(low_52w, 2),
+            "high_52w": round(high_52w, 2),
+        }
+    except Exception as e:
+        logger.warning("Price snapshot error for %s: %s", symbol, e)
+        return None
+
+
+# -------------------------------------------------
 # ADVISOR MODE – OpenAI HELPERS
 # -------------------------------------------------
 def ai_generate(text: str) -> str:
@@ -532,9 +600,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     msg = (
-        "<b>📈 Swing Scanner Bot v3 – Advisor Mode</b>\n\n"
+        "<b>📈 Swing Scanner Bot v3 – Trader Mode</b>\n\n"
         "<b>What I can do for you:</b>\n"
         "• Scan NIFTY 500 for swing setups\n"
+        "• Analyse individual stocks with entry/SL/target\n"
+        "• Show basic price, daily change, 1Y range\n"
         "• Send 30-min alerts for your watchlist\n"
         "• Generate auto-GTT order files\n"
         "• Daily morning suggestions at ~9:15 AM IST\n"
@@ -543,6 +613,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Core commands:</b>\n"
         "/scan – Scan NIFTY 500 now\n"
         "/summary – Quick overview + heatmap + sentiment\n"
+        "/stock SYMBOL – Single-stock swing levels (e.g. /stock BEL)\n"
+        "/price SYMBOL – Basic price + 1Y range (e.g. /price BEL)\n"
         "/alerts_on – 30-min alerts ON\n"
         "/alerts_off – 30-min alerts OFF\n"
         "/daily_on – Daily report ON\n"
@@ -557,7 +629,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ai_scan – AI interpretation of latest scan\n"
         "/ask … – Any swing/market question\n\n"
         "<i>Daily suggestions are now scheduled for this chat at 9:15 AM (IST). "
-        "Trade safe, focus on risk first.</i>\n"
+        "All outputs are for education only, not SEBI-registered advice. Trade safe.</i>\n"
     )
 
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -577,14 +649,11 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["🔥 *Swing Trading Candidates*"]
     for r in results[:20]:
-        pos = calc_position_size(r["price"], r["stoploss"])
-        lines.append(
-            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
-            f"Price: ₹{r['price']}\n"
-            f"Signals: {', '.join(r['signals'])}\n"
-            f"Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
-        )
+        lines.append(format_candidate_block(r))
+
+    lines.append(
+        "\n⚠️ *Educational only – not investment advice. Protect capital first, profits second.*"
+    )
 
     heatmap = build_sector_heatmap(results)
     sentiment = build_sentiment_summary(results)
@@ -653,13 +722,11 @@ async def alerts_job(context: ContextTypes.DEFAULT_TYPE):
     # send top 5
     lines = ["⏰ *30-min Alert – New Swing Candidates*"]
     for r in results[:5]:
-        pos = calc_position_size(r["price"], r["stoploss"])
-        lines.append(
-            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
-            f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"Signals: {', '.join(r['signals'])}\n"
-            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
-        )
+        lines.append(format_candidate_block(r))
+
+    lines.append(
+        "\n⚠️ *Scanner is a helper, not a guarantee. Stick to your risk limits.*"
+    )
 
     heatmap = build_sector_heatmap(results)
     sentiment = build_sentiment_summary(results)
@@ -725,13 +792,11 @@ async def daily_job(context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["🌅 *Daily Swing Suggestions*"]
     for r in results[:15]:
-        pos = calc_position_size(r["price"], r["stoploss"])
-        lines.append(
-            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
-            f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"Signals: {', '.join(r['signals'])}\n"
-            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
-        )
+        lines.append(format_candidate_block(r))
+
+    lines.append(
+        "\n⚠️ *Focus on risk and position sizing. Treat these as ideas, not orders.*"
+    )
 
     heatmap = build_sector_heatmap(results)
     sentiment = build_sentiment_summary(results)
@@ -793,6 +858,105 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo=f,
             caption=f"{symbol} – 6M price with SMA20/50",
         )
+
+
+# ------------------ BASIC TRADER COMMANDS -----------------
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick price, daily change, and 1Y range."""
+    if not await ensure_allowed(update, context):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /price SYMBOL  (e.g. /price BEL)")
+        return
+
+    symbol = context.args[0].upper()
+    await update.message.reply_text(f"Fetching price for {symbol}…")
+
+    snap = await asyncio.to_thread(get_price_snapshot, symbol)
+    if not snap:
+        await update.message.reply_text("Could not fetch price. Check the symbol.")
+        return
+
+    direction = "📈" if snap["change"] > 0 else ("📉" if snap["change"] < 0 else "➖")
+    lines = [
+        f"{direction} *{snap['symbol']}*",
+        f"Last traded price: *₹{snap['price']}*",
+        f"Change: *₹{snap['change']}* ({snap['pct']}%)",
+        "",
+        f"1Y range: ₹{snap['low_52w']} – ₹{snap['high_52w']}",
+        "This is raw price info – not a buy/sell signal.",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Single-stock swing analysis without needing AI:
+    • price
+    • signals (if any)
+    • suggested buy/target/SL
+    • R:R and position size
+    """
+    if not await ensure_allowed(update, context):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /stock SYMBOL  (e.g. /stock BEL)")
+        return
+
+    symbol = context.args[0].upper()
+    symbol_full = symbol if symbol.endswith(".NS") else symbol + ".NS"
+
+    await update.message.reply_text(f"Running swing analysis for {symbol}…")
+
+    analysis = await asyncio.to_thread(analyze_stock, symbol_full)
+
+    # Always try to show price snapshot so the command is useful even without signals
+    snap = await asyncio.to_thread(get_price_snapshot, symbol)
+    if snap is None and analysis is None:
+        await update.message.reply_text(
+            "Could not fetch enough data for this symbol. Check if it is in NSE cash market."
+        )
+        return
+
+    lines = [f"📌 *{symbol} – Single-Stock View*"]
+
+    if snap:
+        direction = "📈" if snap["change"] > 0 else ("📉" if snap["change"] < 0 else "➖")
+        lines.append(
+            f"{direction} Price: *₹{snap['price']}* (Δ ₹{snap['change']} / {snap['pct']}%)"
+        )
+        lines.append(
+            f"1Y range: ₹{snap['low_52w']} – ₹{snap['high_52w']}"
+        )
+
+    if analysis is None:
+        lines.append(
+            "\nNo strong swing signals from the scanner right now.\n"
+            "You can still study the structure manually (trend, support/resistance, volumes) "
+            "and only trade if risk is very clear."
+        )
+    else:
+        rr = calc_rr_ratio(analysis["buy"], analysis["target"], analysis["stoploss"])
+        pos = calc_position_size(analysis["price"], analysis["stoploss"])
+
+        lines.append(
+            "\n*Scanner swing view (technical)*:\n"
+            f"- Signals: {', '.join(analysis['signals'])}\n"
+            f"- Suggested buy zone: around *₹{analysis['buy']}*\n"
+            f"- Target: *₹{analysis['target']}*\n"
+            f"- Stoploss: *₹{analysis['stoploss']}*\n"
+            f"- R:R ≈ *{rr}:1*\n"
+            f"- Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): *{pos}* qty"
+        )
+
+    lines.append(
+        "\n⚠️ This is a tool to structure your thinking. "
+        "No guarantees, not SEBI-registered advice. Always decide position size and risk for yourself."
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 # ------------------ ADVISOR COMMANDS -----------------
@@ -891,13 +1055,11 @@ async def summary_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Top 5 by scan order:",
     ]
     for r in results[:5]:
-        pos = calc_position_size(r["price"], r["stoploss"])
-        lines.append(
-            f"\n📌 *{r['symbol']}* ({r.get('industry','Unknown')})\n"
-            f"Price: ₹{r['price']} | Buy: ₹{r['buy']} | Target: ₹{r['target']} | SL: ₹{r['stoploss']}\n"
-            f"Signals: {', '.join(r['signals'])}\n"
-            f"🧮 Pos size (~{RISK_PERCENT}% risk on ₹{int(DEFAULT_CAPITAL)}): {pos} qty"
-        )
+        lines.append(format_candidate_block(r))
+
+    lines.append(
+        "\n⚠️ Use this as a watchlist, not a blind buy list. Always wait for clean entries."
+    )
 
     heatmap = build_sector_heatmap(results)
     sentiment = build_sentiment_summary(results)
@@ -1030,6 +1192,8 @@ async def cmds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start – Initialise bot & auto-schedule daily 9:15 AM report\n"
         "/scan – Scan NIFTY 500 for swing setups now\n"
         "/summary – Compact summary + heatmap + sentiment\n"
+        "/stock SYMBOL – Single-stock swing levels (e.g. /stock BEL)\n"
+        "/price SYMBOL – Basic price + 1Y range (e.g. /price BEL)\n"
         "/panel – Open inline control panel\n"
         "/dash – Show logging dashboard from DB\n\n"
         "<b>Automation</b>\n"
@@ -1044,7 +1208,8 @@ async def cmds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/explain SYMBOL – AI explanation based on scanner (e.g. /explain BEL)\n"
         "/ai_scan – AI interpretation of latest scan\n"
         "/ask question… – Ask any swing/market question\n\n"
-        "<i>Note:</i> This bot is locked to the owner account and is for educational use only."
+        "<i>Note:</i> This bot is locked to the owner account and is for educational use only. "
+        "Not SEBI-registered advice."
     )
 
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
@@ -1071,6 +1236,10 @@ def main():
     app.add_handler(CommandHandler("panel", panel_cmd))
     app.add_handler(CommandHandler("cmds", cmds_cmd))
 
+    # New basic trader utilities
+    app.add_handler(CommandHandler("price", price_cmd))
+    app.add_handler(CommandHandler("stock", stock_cmd))
+
     # Advisor commands
     app.add_handler(CommandHandler("explain", explain_cmd))
     app.add_handler(CommandHandler("ai_scan", ai_scan_cmd))
@@ -1080,7 +1249,8 @@ def main():
     app.add_handler(CallbackQueryHandler(panel_callback, pattern="^panel_"))
 
     print(
-        "Bot is running with scanner + alerts + daily + charts + GTT + DB + advisor mode + dashboards + panel…"
+        "Bot running with scanner + alerts + daily + charts + GTT + DB + advisor mode "
+        "+ dashboards + panel + price/stock utilities…"
     )
     app.run_polling()
 
